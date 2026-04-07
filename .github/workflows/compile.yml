@@ -81,20 +81,30 @@ jobs:
                 </intent-filter> \
             </provider>' apk_src/AndroidManifest.xml
           fi
-          
       - name: Build and Sign
         run: |
-          # 1. 回编译 APK
-          apktool b apk_src -o unsigned.apk
+          # 1. 使用 apktool 回编译
+          apktool b apk_src -o unsigned_apk_tmp.apk
           
-          # 2. 直接使用根目录下的密钥文件进行签名
-          # 注意：密码等敏感信息依然建议放在 GitHub Secrets 中
+          # 2. 对齐 APK (Zipalign) - 这是解决不兼容的关键步骤之一
+          # zipalign 必须在签名之前执行（针对 V2/V3 签名）
+          $ANDROID_HOME/build-tools/34.0.0/zipalign -v 4 unsigned_apk_tmp.apk unsigned_aligned.apk
+          
+          # 3. 签名 APK
+          # 加入环境变量导出，尝试解决 KeyStore 编码兼容性
+          export JAVA_OPTS="-Dsun.security.pkcs12.allowLegacy=true"
+          
           $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks key.jks \
             --ks-key-alias "${{ secrets.JKS_ALIAS }}" \
             --ks-pass pass:"${{ secrets.JKS_PASSWORD }}" \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
-            --out final_signed.apk unsigned.apk
+            --v3-signing-enabled true \
+            --out final_signed.apk unsigned_aligned.apk
+          
+          # 4. 验证签名（可选，可以在日志里查看是否成功）
+          $ANDROID_HOME/build-tools/34.0.0/apksigner verify -v final_signed.apk
+
 
       - name: Upload
         uses: actions/upload-artifact@v4
