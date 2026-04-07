@@ -11,10 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-distribution: 'temurin'
+          distribution: 'temurin' # 核心错误：这里必须是 distribution
           java-version: '17'
 
       - name: Install Build Tools
