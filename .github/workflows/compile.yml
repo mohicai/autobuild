@@ -21,10 +21,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y apktool aapt
-          # 不再通过 wget 下载 baksmali，避免 404 错误
-          # 直接定位系统中安装的 apktool jar 路径
-          APKTOOL_JAR=$(dpkg -L apktool | grep jar)
-          echo "APKTOOL_JAR_PATH=$APKTOOL_JAR" >> $GITHUB_ENV
 
       - name: Decompile Target APK
         run: |
@@ -41,26 +37,35 @@ jobs:
           PKG_PATH=$(echo $PKG_NAME | tr '.' '/')
           echo "TARGET_PKG_PATH=$PKG_PATH" >> $GITHUB_ENV
           
-          # 修改源码中的包名占位符
+          # 替换源码中的包名占位符 (请确保 SAFProvider.java 中使用的是 PACKAGE_NAME_PLACEHOLDER)
           sed -i "s/PACKAGE_NAME_PLACEHOLDER/$PKG_NAME/g" SAFProvider.java
 
-      - name: Compile SAFProvider to Smali
+      - name: Compile SAFProvider to Smali (Safe Path)
         run: |
-          # 1. 编译 Java (优先使用 Android SDK 的库)
-          CP="$ANDROID_HOME/platforms/$(ls $ANDROID_HOME/platforms | sort -r | head -n 1)/android.jar"
+          # 1. 自动寻找 android.jar
+          PLATFORM_DIR=$(ls -d $ANDROID_HOME/platforms/android-* | sort -V | tail -n 1)
+          CP="$PLATFORM_DIR/android.jar"
+          echo "Using Android SDK: $CP"
+          
           javac -encoding UTF-8 -classpath "$CP" SAFProvider.java
           
           # 2. 编译 Class 为 Dex
           $ANDROID_HOME/build-tools/34.0.0/d8 --lib "$CP" --output . SAFProvider.class
           
-          # 3. 关键：利用 apktool 内部包含的 baksmali 引擎进行反编译
-          # 这种方法不需要单独下载 baksmali.jar
-          java -cp ${{ env.APKTOOL_JAR_PATH }} org.jf.baksmali.Main d classes.dex -o smali_out/
+          # 3. 核心：动态寻找 apktool 的真实 JAR 路径
+          # 我们扫描常见的安装路径，直到找到包含 baksmali 类的那个
+          REAL_JAR=$(find /usr/share/java /usr/share/apktool -name "*.jar" | xargs grep -l "baksmali" | head -n 1)
+          echo "Found real JAR: $REAL_JAR"
+          
+          # 4. 执行反编译
+          java -cp "$REAL_JAR" org.jf.baksmali.Main d classes.dex -o smali_out/
 
       - name: Inject Code and Manifest
         run: |
           # 创建目录并拷贝生成的 smali
           mkdir -p apk_src/smali/${{ env.TARGET_PKG_PATH }}/
+          
+          # 这里的 find 确保即使 baksmali 生成了 package 文件夹也能被找到
           find smali_out -name "SAFProvider*.smali" -exec cp {} apk_src/smali/${{ env.TARGET_PKG_PATH }}/ \;
 
           # 注入 Manifest
@@ -79,10 +84,8 @@ jobs:
 
       - name: Build and Sign
         run: |
-          # 回编译
           apktool b apk_src -o unsigned.apk
           
-          # 签名
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > key.jks
           $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks key.jks \
             --ks-key-alias "${{ secrets.JKS_ALIAS }}" \
@@ -92,5 +95,5 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: Injected-APK
+          name: Injected-APK-${{ env.TARGET_PKG }}
           path: final_signed.apk
