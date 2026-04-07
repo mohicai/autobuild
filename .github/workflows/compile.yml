@@ -1,0 +1,93 @@
+name: Universal SAF Injection Workflow
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # 支持手动上传 APK 触发
+
+jobs:
+  inject-and-sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apktool
+          # 下载 baksmali 转换 dex 为 smali
+          wget https://bitbucket.org/JesusFreke/smali/downloads/baksmali-2.5.2.jar -O baksmali.jar
+
+      - name: Extract APK Info & Patch Source
+        run: |
+          # 1. 自动获取目标 APK 的包名 (假设文件名为 target.apk)
+          # 使用 SDK 中的 aapt 工具
+          PKG_NAME=$($ANDROID_HOME/build-tools/34.0.0/aapt dump badging target.apk | grep package | awk -F"'" '{print $2}')
+          echo "TARGET_PKG=$PKG_NAME" >> $GITHUB_ENV
+          
+          # 2. 将点号包名转换为路径格式 (如 com.abc.xyz -> com/abc/xyz)
+          PKG_PATH=$(echo $PKG_NAME | tr '.' '/')
+          echo "TARGET_PKG_PATH=$PKG_PATH" >> $GITHUB_ENV
+          
+          # 3. 替换 Java 源码中的占位符
+          sed -i "s/PACKAGE_NAME_PLACEHOLDER/$PKG_NAME/g" SAFProvider.java
+          echo "Successfully patched SAFProvider.java with $PKG_NAME"
+
+      - name: Compile SAFProvider to Smali
+        run: |
+          # 1. 编译 Java (确保仓库根目录有 android.jar)
+          javac -encoding UTF-8 -classpath android.jar SAFProvider.java
+          
+          # 2. 将 .class 编译为 .dex
+          $ANDROID_HOME/build-tools/34.0.0/d8 --lib android.jar --output . SAFProvider.class
+          
+          # 3. 将 .dex 转换为 .smali
+          java -jar baksmali.jar d classes.dex -o smali_out/
+
+      - name: Decompile and Inject
+        run: |
+          # 1. 反编译目标 APK
+          apktool d target.apk -o apk_src
+          
+          # 2. 将生成的 smali 文件移动到目标 APK 对应的包名路径下
+          mkdir -p apk_src/smali/${{ env.TARGET_PKG_PATH }}/
+          cp -r smali_out/${{ env.TARGET_PKG_PATH }}/* apk_src/smali/${{ env.TARGET_PKG_PATH }}/
+          
+          # 3. 在 AndroidManifest.xml 中注入 Provider 声明
+          # 这里的 sed 会定位到 </application> 标签前插入配置
+          sed -i '/<\/application>/i \
+          <provider android:name="${{ env.TARGET_PKG }}.SAFProvider" \
+              android:authorities="${{ env.TARGET_PKG }}.documents" \
+              android:exported="true" \
+              android:grantUriPermissions="true" \
+              android:permission="android.permission.MANAGE_DOCUMENTS"> \
+              <intent-filter> \
+                  <action android:name="android.content.action.DOCUMENTS_PROVIDER" /> \
+              </intent-filter> \
+          </provider>' apk_src/AndroidManifest.xml
+
+      - name: Rebuild APK
+        run: |
+          apktool b apk_src -o unsigned.apk
+
+      - name: Sign APK
+        run: |
+          # 从 GitHub Secrets 读取 JKS 密钥
+          echo "${{ secrets.JKS_BASE64 }}" | base64 -d > key.jks
+          
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks key.jks \
+            --ks-key-alias "${{ secrets.JKS_ALIAS }}" \
+            --ks-pass pass:"${{ secrets.JKS_PASSWORD }}" \
+            --out final_signed.apk unsigned.apk
+
+      - name: Upload Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: injected-apk
+          path: final_signed.apk
