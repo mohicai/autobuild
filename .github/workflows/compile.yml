@@ -20,8 +20,9 @@ jobs:
       - name: Install Tools
         run: |
           sudo apt-get update
-          # 安装 apktool 和 aapt
           sudo apt-get install -y apktool aapt
+          # 使用特定的、有效的 GitHub Proxy 或直接下载链接 (baksmali v2.5.2)
+          curl -L https://github.com/google/smali/releases/download/v2.5.2/baksmali-2.5.2.jar -o baksmali.jar
 
       - name: Decompile Target APK
         run: |
@@ -30,7 +31,7 @@ jobs:
 
       - name: Extract Package Name & Patch Source
         run: |
-          # 1. 自动提取包名
+          # 1. 获取真实包名 (从日志看你的包名是 me.sheimi.sgit)
           PKG_NAME=$(aapt dump badging target.apk | grep package | awk -F"'" '{print $2}')
           echo "TARGET_PKG=$PKG_NAME" >> $GITHUB_ENV
           
@@ -41,28 +42,27 @@ jobs:
           # 3. 替换源码占位符
           sed -i "s/PACKAGE_NAME_PLACEHOLDER/$PKG_NAME/g" SAFProvider.java
 
-      - name: Compile SAFProvider to Smali (Internal Engine)
+      - name: Compile SAFProvider to Smali
         run: |
-          # 1. 编译 Java (依赖仓库根目录的 android.jar)
+          # 1. 编译 Java
           javac -encoding UTF-8 -classpath android.jar SAFProvider.java
           
           # 2. 编译 Class 为 Dex
           $ANDROID_HOME/build-tools/34.0.0/d8 --lib android.jar --output . SAFProvider.class
           
-          # 3. 核心：使用 apktool 内置的 baksmali 引擎进行反编译
-          # apktool 2.x 的 jar 包通常在 /usr/share/java/apktool.jar
-          java -jar /usr/share/java/apktool.jar d classes.dex -o smali_out/ || \
-          java -cp /usr/share/java/apktool.jar org.jf.baksmali.Main d classes.dex -o smali_out/
+          # 3. 反编译 Dex 为 Smali (使用刚刚下载的 jar)
+          java -jar baksmali.jar d classes.dex -o smali_out/
 
       - name: Inject Code and Manifest
         run: |
-          # 1. 移动 Smali 文件 (包含匿名类)
+          # 1. 创建目标路径
           mkdir -p apk_src/smali/${{ env.TARGET_PKG_PATH }}/
-          cp smali_out/classes/PACKAGE_NAME_PLACEHOLDER/SAFProvider*.smali apk_src/smali/${{ env.TARGET_PKG_PATH }}/ || \
-          cp smali_out/com/example/SAFProvider*.smali apk_src/smali/${{ env.TARGET_PKG_PATH }}/ || \
-          cp smali_out/*.smali apk_src/smali/${{ env.TARGET_PKG_PATH }}/
+          
+          # 2. 寻找生成的 smali 文件并移动
+          # 因为 d8/baksmali 可能会根据 package 声明生成深层目录
+          find smali_out -name "SAFProvider*.smali" -exec cp {} apk_src/smali/${{ env.TARGET_PKG_PATH }}/ \;
 
-          # 2. 注入 Manifest
+          # 3. 注入 Manifest
           sed -i '/<\/application>/i \
           <provider android:name="${{ env.TARGET_PKG }}.SAFProvider" \
               android:authorities="${{ env.TARGET_PKG }}.documents" \
