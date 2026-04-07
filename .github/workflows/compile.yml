@@ -1,9 +1,9 @@
-name: Universal SAF Injection Workflow
+name: Universal SAF Injection
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: # 支持手动上传 APK 触发
+  workflow_dispatch:
 
 jobs:
   inject-and-sign:
@@ -11,57 +11,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin' # 核心错误：这里必须是 distribution
+          distribution: 'temurin'
           java-version: '17'
 
-      - name: Install Build Tools
+      - name: Install Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y apktool
-          # 下载 baksmali 转换 dex 为 smali
-          wget https://bitbucket.org/JesusFreke/smali/downloads/baksmali-2.5.2.jar -O baksmali.jar
+          sudo apt-get install -y apktool aapt
+          # 使用 Google 维护的 GitHub Release 地址，替代已失效的 Bitbucket 链接
+          wget https://github.com/google/smali/releases/download/v2.5.2/baksmali-2.5.2.jar -O baksmali.jar
 
-      - name: Extract APK Info & Patch Source
+      - name: Decompile Target APK
         run: |
-          # 1. 自动获取目标 APK 的包名 (假设文件名为 target.apk)
-          # 使用 SDK 中的 aapt 工具
-          PKG_NAME=$($ANDROID_HOME/build-tools/34.0.0/aapt dump badging target.apk | grep package | awk -F"'" '{print $2}')
+          # 反编译 APK 到 apk_src 目录
+          apktool d target.apk -o apk_src
+
+      - name: Extract Package Name & Patch Source
+        run: |
+          # 1. 自动从 Manifest 中提取真实包名
+          PKG_NAME=$(aapt dump badging target.apk | grep package | awk -F"'" '{print $2}')
+          echo "Detected Package: $PKG_NAME"
           echo "TARGET_PKG=$PKG_NAME" >> $GITHUB_ENV
           
-          # 2. 将点号包名转换为路径格式 (如 com.abc.xyz -> com/abc/xyz)
+          # 2. 将点号包名转为路径 (例如 com.test.app -> com/test/app)
           PKG_PATH=$(echo $PKG_NAME | tr '.' '/')
           echo "TARGET_PKG_PATH=$PKG_PATH" >> $GITHUB_ENV
           
           # 3. 替换 Java 源码中的占位符
           sed -i "s/PACKAGE_NAME_PLACEHOLDER/$PKG_NAME/g" SAFProvider.java
-          echo "Successfully patched SAFProvider.java with $PKG_NAME"
 
       - name: Compile SAFProvider to Smali
         run: |
-          # 1. 编译 Java (确保仓库根目录有 android.jar)
+          # 1. 编译 Java (依赖 android.jar)
           javac -encoding UTF-8 -classpath android.jar SAFProvider.java
           
-          # 2. 将 .class 编译为 .dex
+          # 2. 编译 Class 为 Dex
           $ANDROID_HOME/build-tools/34.0.0/d8 --lib android.jar --output . SAFProvider.class
           
-          # 3. 将 .dex 转换为 .smali
+          # 3. 反编译 Dex 为 Smali
           java -jar baksmali.jar d classes.dex -o smali_out/
 
-      - name: Decompile and Inject
+      - name: Inject Code and Manifest
         run: |
-          # 1. 反编译目标 APK
-          apktool d target.apk -o apk_src
-          
-          # 2. 将生成的 smali 文件移动到目标 APK 对应的包名路径下
+          # 1. 创建目标包名目录并移动 Smali 文件
+          # 使用通配符 SAFProvider*.smali 以包含可能产生的匿名类文件
           mkdir -p apk_src/smali/${{ env.TARGET_PKG_PATH }}/
-          cp -r smali_out/${{ env.TARGET_PKG_PATH }}/* apk_src/smali/${{ env.TARGET_PKG_PATH }}/
+          cp smali_out/${{ env.TARGET_PKG_PATH }}/SAFProvider*.smali apk_src/smali/${{ env.TARGET_PKG_PATH }}/
           
-          # 3. 在 AndroidManifest.xml 中注入 Provider 声明
-          # 这里的 sed 会定位到 </application> 标签前插入配置
+          # 2. 注入 Provider 声明到 AndroidManifest.xml
+          # 在 </application> 闭合标签前插入配置
           sed -i '/<\/application>/i \
           <provider android:name="${{ env.TARGET_PKG }}.SAFProvider" \
               android:authorities="${{ env.TARGET_PKG }}.documents" \
@@ -73,22 +74,26 @@ jobs:
               </intent-filter> \
           </provider>' apk_src/AndroidManifest.xml
 
-      - name: Rebuild APK
+      - name: Build Unsigned APK
         run: |
+          # 回编译 APK
           apktool b apk_src -o unsigned.apk
 
-      - name: Sign APK
+      - name: Sign APK with JKS
         run: |
-          # 从 GitHub Secrets 读取 JKS 密钥
+          # 从 Secrets 还原 JKS 文件
           echo "${{ secrets.JKS_BASE64 }}" | base64 -d > key.jks
           
+          # 签名并对齐
           $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks key.jks \
             --ks-key-alias "${{ secrets.JKS_ALIAS }}" \
             --ks-pass pass:"${{ secrets.JKS_PASSWORD }}" \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
             --out final_signed.apk unsigned.apk
 
-      - name: Upload Result
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: injected-apk
+          name: Injected-SAF-APK
           path: final_signed.apk
